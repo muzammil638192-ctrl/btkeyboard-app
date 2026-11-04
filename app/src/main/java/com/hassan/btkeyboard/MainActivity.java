@@ -4,6 +4,11 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothHidDevice;
@@ -15,11 +20,14 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.text.Editable;
 import android.text.InputType;
@@ -33,6 +41,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -42,6 +51,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.Executor;
 
 @SuppressLint("MissingPermission")
 public class MainActivity extends Activity {
@@ -52,7 +62,7 @@ public class MainActivity extends Activity {
         return o;
     }
 
-    // HID descriptor: keyboard (report ID 1, 8 bytes) + mouse (report ID 2, 4 bytes)
+    // HID: keyboard (ID 1, 8 bytes) + mouse (ID 2, 4 bytes) + media keys (ID 3, 2 bytes)
     private static final byte[] DESC = bytes(
             0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
             0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
@@ -69,12 +79,17 @@ public class MainActivity extends Activity {
             0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
             0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
             0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
-            0xC0, 0xC0);
+            0xC0, 0xC0,
+            0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03,
+            0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03,
+            0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+            0xC0);
 
     private static final int C_NORMAL = 0xFF2C2C2E;
     private static final int C_MOD = 0xFF3F3F46;
     private static final int C_PRESSED = 0xFF6B6B73;
     private static final int C_ACTIVE = 0xFF0A84FF;
+    private static final int C_GREEN = 0xFF30A46C;
 
     private static final int M_CTRL = 0x01, M_SHIFT = 0x02, M_ALT = 0x04, M_WIN = 0x08;
     private static final float SENS = 1.8f;
@@ -111,11 +126,159 @@ public class MainActivity extends Activity {
         addChar('\t', 0, 0x2B);
     }
 
-    private BluetoothAdapter adapter;
-    private BluetoothHidDevice hid;
-    private BluetoothDevice host;
-    private boolean registered = false;
-    private boolean proxyRequested = false;
+    // ---- Bluetooth state lives in statics so the connection survives leaving the app ----
+    private static final Handler H = new Handler(Looper.getMainLooper());
+    private static final Executor MAIN_EXEC = r -> H.post(r);
+    private static Context sApp;
+    private static MainActivity sUi;
+    private static BluetoothAdapter sAdapter;
+    private static BluetoothHidDevice sHid;
+    private static BluetoothDevice sHost;
+    private static boolean sRegistered = false;
+    private static boolean sProxyRequested = false;
+    private static int sRetries = 0;
+
+    private static final BluetoothHidDevice.Callback HID_CB = new BluetoothHidDevice.Callback() {
+        @Override
+        public void onAppStatusChanged(BluetoothDevice pluggedDevice, boolean reg) {
+            sRegistered = reg;
+            if (reg && sHost == null) reconnectLast();
+            refreshUi();
+        }
+
+        @Override
+        public void onConnectionStateChanged(BluetoothDevice device, int state) {
+            if (state == BluetoothProfile.STATE_CONNECTED) {
+                sHost = device;
+                sRetries = 0;
+                try {
+                    sApp.getSharedPreferences("bt", Context.MODE_PRIVATE).edit()
+                            .putString("last", device.getAddress()).apply();
+                } catch (Throwable ignored) {
+                }
+            } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
+                if (device.equals(sHost)) sHost = null;
+                if (sHid != null && sRetries < 6) {
+                    sRetries++;
+                    H.postDelayed(MainActivity::reconnectLast, 4000);
+                }
+            }
+            refreshUi();
+        }
+    };
+
+    private static final BluetoothProfile.ServiceListener PROXY_L =
+            new BluetoothProfile.ServiceListener() {
+                @Override
+                public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                    if (profile == BluetoothProfile.HID_DEVICE) {
+                        sHid = (BluetoothHidDevice) proxy;
+                        registerKeyboard();
+                    }
+                }
+
+                @Override
+                public void onServiceDisconnected(int profile) {
+                    sHid = null;
+                    sRegistered = false;
+                    sHost = null;
+                    sProxyRequested = false;
+                    refreshUi();
+                }
+            };
+
+    private static void registerKeyboard() {
+        try {
+            BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
+                    "BT Keyboard", "Phone keyboard", "Hassan",
+                    BluetoothHidDevice.SUBCLASS1_COMBO, DESC);
+            sHid.registerApp(sdp, null, null, MAIN_EXEC, HID_CB);
+        } catch (Throwable t) {
+            showStatus("HID error: " + t);
+        }
+    }
+
+    private static void reconnectLast() {
+        try {
+            if (sHid == null || sHost != null || sAdapter == null || sApp == null) return;
+            String addr = sApp.getSharedPreferences("bt", Context.MODE_PRIVATE)
+                    .getString("last", null);
+            if (addr == null) return;
+            sHid.connect(sAdapter.getRemoteDevice(addr));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void shutdownHid() {
+        try {
+            if (sHid != null) {
+                sHid.unregisterApp();
+                if (sAdapter != null) {
+                    sAdapter.closeProfileProxy(BluetoothProfile.HID_DEVICE, sHid);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        sHid = null;
+        sHost = null;
+        sRegistered = false;
+        sProxyRequested = false;
+        refreshUi();
+    }
+
+    private static void refreshUi() {
+        if (sUi != null) sUi.updateStatus();
+    }
+
+    private static void showStatus(String s) {
+        if (sUi != null && sUi.status != null) sUi.status.setText(s);
+    }
+
+    // Keeps the app process alive so the laptop stays connected
+    public static class KeepAliveService extends Service {
+        @Override
+        public IBinder onBind(Intent intent) {
+            return null;
+        }
+
+        @Override
+        public int onStartCommand(Intent intent, int flags, int startId) {
+            if (intent != null && "STOP".equals(intent.getAction())) {
+                shutdownHid();
+                stopForeground(true);
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            nm.createNotificationChannel(new NotificationChannel(
+                    "btkb", "BT Keyboard", NotificationManager.IMPORTANCE_LOW));
+            PendingIntent openPi = PendingIntent.getActivity(this, 0,
+                    new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+            Intent stop = new Intent(this, KeepAliveService.class);
+            stop.setAction("STOP");
+            PendingIntent stopPi = PendingIntent.getService(this, 1, stop,
+                    PendingIntent.FLAG_IMMUTABLE);
+            Notification.Action act = new Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                    "Band karo", stopPi).build();
+            Notification n = new Notification.Builder(this, "btkb")
+                    .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                    .setContentTitle("BT Keyboard chal raha hai")
+                    .setContentText("Laptop se connection bana rahega")
+                    .setContentIntent(openPi)
+                    .addAction(act)
+                    .setOngoing(true)
+                    .build();
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+            } else {
+                startForeground(1, n);
+            }
+            return START_NOT_STICKY;
+        }
+    }
+
+    // ---- per-screen state ----
     private int mods = 0;
     private int mouseButtons = 0;
 
@@ -131,7 +294,6 @@ public class MainActivity extends Activity {
     private boolean suppress = false;
     private String prev = "";
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
     private final ArrayDeque<int[]> queue = new ArrayDeque<>();
     private boolean pumping = false;
 
@@ -155,7 +317,8 @@ public class MainActivity extends Activity {
 
     private static K k(String l, int c) { return new K(l, c, 0, 1f); }
     private static K kw(String l, int c, float w) { return new K(l, c, 0, w); }
-    private static K m(String l, int mod) { return new K(l, 0, mod, 1.3f); }
+    private static K mw(String l, int mod, float w) { return new K(l, 0, mod, w); }
+    private static K sp(float w) { return new K("", -1, 0, w); }
 
     private static K[] letters(String s) {
         K[] r = new K[s.length()];
@@ -191,6 +354,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        sApp = getApplicationContext();
 
         final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((t, ex) -> {
@@ -211,16 +375,32 @@ public class MainActivity extends Activity {
         try {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             buildUi();
+            sUi = this;
+            List<String> need = new ArrayList<>();
             if (Build.VERSION.SDK_INT >= 31
                     && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
                     != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 1);
+                need.add(Manifest.permission.BLUETOOTH_CONNECT);
+            }
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                need.add(Manifest.permission.POST_NOTIFICATIONS);
+            }
+            if (!need.isEmpty()) {
+                requestPermissions(need.toArray(new String[0]), 1);
             } else {
                 initHid();
             }
         } catch (Throwable t) {
             showCrash(Log.getStackTraceString(t));
         }
+    }
+
+    private boolean hasBtPermission() {
+        return Build.VERSION.SDK_INT < 31
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     private void showCrash(String trace) {
@@ -260,7 +440,7 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int rc, String[] p, int[] r) {
         super.onRequestPermissionsResult(rc, p, r);
         if (status == null) return;
-        if (r.length > 0 && r[0] == PackageManager.PERMISSION_GRANTED) {
+        if (hasBtPermission()) {
             initHid();
         } else {
             status.setText("Bluetooth (Nearby devices) permission dena zaroori hai");
@@ -273,12 +453,12 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF121212);
-        root.setPadding(dp(4), dp(8), dp(4), dp(8));
+        root.setPadding(dp(2), dp(6), dp(2), dp(6));
 
         status = new TextView(this);
         status.setTextColor(Color.WHITE);
-        status.setTextSize(14);
-        status.setPadding(dp(8), dp(4), dp(8), dp(4));
+        status.setTextSize(13);
+        status.setPadding(dp(8), dp(2), dp(8), dp(2));
         status.setText("Shuru ho raha hai...");
         root.addView(status, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -288,10 +468,10 @@ public class MainActivity extends Activity {
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.addView(barButton("Visible", C_ACTIVE, v -> makeVisible()), barLp());
         bar.addView(barButton("Laptop chuno", C_ACTIVE, v -> chooseHost()), barLp());
-        modeBtn = barButton("Gboard", 0xFF30A46C, v -> setMode(!gboardMode));
+        modeBtn = barButton("Gboard", C_GREEN, v -> setMode(!gboardMode));
         bar.addView(modeBtn, barLp());
         root.addView(bar, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(46)));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
 
         // text box + paste / clear
         boxRow = new LinearLayout(this);
@@ -304,7 +484,7 @@ public class MainActivity extends Activity {
         box.setTextColor(Color.WHITE);
         box.setTextSize(16);
         box.setGravity(Gravity.TOP | Gravity.START);
-        box.setPadding(dp(10), dp(8), dp(10), dp(8));
+        box.setPadding(dp(10), dp(6), dp(10), dp(6));
         box.setShowSoftInputOnFocus(false);
         setBg(box, 0xFF1E1E22);
         box.addTextChangedListener(new TextWatcher() {
@@ -337,9 +517,36 @@ public class MainActivity extends Activity {
                 dp(72), LinearLayout.LayoutParams.MATCH_PARENT));
 
         LinearLayout.LayoutParams boxRowLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(84));
-        boxRowLp.topMargin = dp(6);
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+        boxRowLp.topMargin = dp(4);
         root.addView(boxRow, boxRowLp);
+
+        // shortcut strip (scrolls sideways)
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        LinearLayout shortRow = new LinearLayout(this);
+        shortRow.setOrientation(LinearLayout.HORIZONTAL);
+        addShortcut(shortRow, "Screenshot", C_GREEN, M_WIN, 0x46, 0);
+        addShortcut(shortRow, "Snip", C_GREEN, M_WIN | M_SHIFT, 0x16, 0);
+        addShortcut(shortRow, "Copy", C_MOD, M_CTRL, 0x06, 0);
+        addShortcut(shortRow, "Paste", C_MOD, M_CTRL, 0x19, 0);
+        addShortcut(shortRow, "Cut", C_MOD, M_CTRL, 0x1B, 0);
+        addShortcut(shortRow, "Undo", C_MOD, M_CTRL, 0x1D, 0);
+        addShortcut(shortRow, "All", C_MOD, M_CTRL, 0x04, 0);
+        addShortcut(shortRow, "Save", C_MOD, M_CTRL, 0x16, 0);
+        addShortcut(shortRow, "Alt+Tab", C_MOD, M_ALT, 0x2B, 0);
+        addShortcut(shortRow, "Desktop", C_MOD, M_WIN, 0x07, 0);
+        addShortcut(shortRow, "Lock", C_MOD, M_WIN, 0x0F, 0);
+        addShortcut(shortRow, "Task Mgr", C_MOD, M_CTRL | M_SHIFT, 0x29, 0);
+        addShortcut(shortRow, "Vol -", C_MOD, 0, 0, 0xEA);
+        addShortcut(shortRow, "Vol +", C_MOD, 0, 0, 0xE9);
+        addShortcut(shortRow, "Mute", C_MOD, 0, 0, 0xE2);
+        addShortcut(shortRow, "Play/Pause", C_MOD, 0, 0, 0xCD);
+        hs.addView(shortRow);
+        LinearLayout.LayoutParams hsLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(38));
+        hsLp.topMargin = dp(4);
+        root.addView(hs, hsLp);
 
         // touchpad + scroll strip
         padRow = new LinearLayout(this);
@@ -351,20 +558,20 @@ public class MainActivity extends Activity {
                 0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
         padLp.setMargins(dp(2), dp(2), dp(2), dp(2));
         padRow.addView(pad, padLp);
-        TextView strip = new TextView(this);
-        strip.setText("\u2195");
-        strip.setTextColor(Color.WHITE);
-        strip.setTextSize(22);
-        strip.setGravity(Gravity.CENTER);
-        setBg(strip, C_NORMAL);
-        strip.setOnTouchListener(scrollListener());
+        TextView scrollStrip = new TextView(this);
+        scrollStrip.setText("\u2195");
+        scrollStrip.setTextColor(Color.WHITE);
+        scrollStrip.setTextSize(22);
+        scrollStrip.setGravity(Gravity.CENTER);
+        setBg(scrollStrip, C_NORMAL);
+        scrollStrip.setOnTouchListener(scrollListener());
         LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
                 dp(52), LinearLayout.LayoutParams.MATCH_PARENT);
         stripLp.setMargins(dp(2), dp(2), dp(2), dp(2));
-        padRow.addView(strip, stripLp);
+        padRow.addView(scrollStrip, stripLp);
         LinearLayout.LayoutParams padRowLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.3f);
-        padRowLp.topMargin = dp(6);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.8f);
+        padRowLp.topMargin = dp(4);
         root.addView(padRow, padRowLp);
 
         // click buttons
@@ -372,15 +579,17 @@ public class MainActivity extends Activity {
         clickRow.setOrientation(LinearLayout.HORIZONTAL);
         clickRow.addView(clickButton("Left Click", 1), barLp());
         clickRow.addView(clickButton("Right Click", 2), barLp());
-        root.addView(clickRow, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
+        LinearLayout.LayoutParams clickLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
+        clickLp.topMargin = dp(2);
+        root.addView(clickRow, clickLp);
 
         // keyboard
         kb = new LinearLayout(this);
         kb.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams kbLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 3.7f);
-        kbLp.topMargin = dp(6);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 4.6f);
+        kbLp.topMargin = dp(4);
         root.addView(kb, kbLp);
 
         List<K[]> rows = new ArrayList<>();
@@ -388,27 +597,32 @@ public class MainActivity extends Activity {
                 k("F4", 0x3D), k("F5", 0x3E), k("F6", 0x3F), k("Del", 0x4C)});
         rows.add(new K[]{k("F7", 0x40), k("F8", 0x41), k("F9", 0x42), k("F10", 0x43),
                 k("F11", 0x44), k("F12", 0x45), k("Home", 0x4A), k("End", 0x4D)});
+        rows.add(new K[]{mw("Ctrl", M_CTRL, 1.3f), mw("Alt", M_ALT, 1.3f),
+                mw("Win", M_WIN, 1.3f), k("Tab", 0x2B), k("Caps", 0x39),
+                k("\u2190", 0x50), k("\u2193", 0x51), k("\u2191", 0x52), k("\u2192", 0x4F)});
+        rows.add(new K[]{k("`", 0x35), k("-", 0x2D), k("=", 0x2E), k("[", 0x2F),
+                k("]", 0x30), k(";", 0x33), k("'", 0x34), k("\\", 0x31), k("/", 0x38)});
         rows.add(digits());
         rows.add(letters("qwertyuiop"));
-        rows.add(concat(letters("asdfghjkl"), kw("Enter", 0x28, 1.6f)));
-        rows.add(concat(new K[]{m("Shift", M_SHIFT)}, concat(letters("zxcvbnm"),
-                kw("\u232B", 0x2A, 1.4f))));
-        rows.add(new K[]{k("-", 0x2D), k("=", 0x2E), k("[", 0x2F), k("]", 0x30),
-                k(";", 0x33), k("'", 0x34), k(",", 0x36), k(".", 0x37),
-                k("/", 0x38), k("\\", 0x31)});
-        rows.add(new K[]{m("Ctrl", M_CTRL), m("Alt", M_ALT), m("Win", M_WIN),
-                k("Tab", 0x2B), k("Caps", 0x39), k("`", 0x35)});
-        rows.add(new K[]{kw("Space", 0x2C, 4f), k("\u2190", 0x50), k("\u2193", 0x51),
-                k("\u2191", 0x52), k("\u2192", 0x4F)});
+        rows.add(concat(new K[]{sp(0.5f)}, concat(letters("asdfghjkl"), sp(0.5f))));
+        rows.add(concat(new K[]{mw("Shift", M_SHIFT, 1.5f)},
+                concat(letters("zxcvbnm"), kw("\u232B", 0x2A, 1.5f))));
+        rows.add(new K[]{k(",", 0x36), kw("Space", 0x2C, 5f), k(".", 0x37),
+                kw("Enter", 0x28, 1.6f)});
 
         for (K[] row : rows) {
             LinearLayout r = new LinearLayout(this);
             r.setOrientation(LinearLayout.HORIZONTAL);
             for (K key : row) {
+                if (key.code < 0 && key.mod == 0) {
+                    r.addView(new View(this), new LinearLayout.LayoutParams(0,
+                            LinearLayout.LayoutParams.MATCH_PARENT, key.w));
+                    continue;
+                }
                 Button b = makeKey(key);
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
                         LinearLayout.LayoutParams.MATCH_PARENT, key.w);
-                lp.setMargins(dp(2), dp(2), dp(2), dp(2));
+                lp.setMargins(dp(1), dp(2), dp(1), dp(2));
                 r.addView(b, lp);
             }
             kb.addView(r, new LinearLayout.LayoutParams(
@@ -442,6 +656,32 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    private void addShortcut(LinearLayout row, String label, int color,
+                             final int mod, final int code, final int usage) {
+        Button b = barButton(label, color, v -> runShortcut(label, mod, code, usage));
+        b.setTextSize(13);
+        b.setPadding(dp(12), 0, dp(12), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT);
+        lp.setMargins(dp(2), 0, dp(2), 0);
+        row.addView(b, lp);
+    }
+
+    private void runShortcut(String label, int mod, int code, int usage) {
+        if (usage != 0) {
+            for (int i = 0; i < 3; i++) queue.add(new int[]{-1, usage});
+            queue.add(new int[]{-1, 0});
+        } else {
+            for (int i = 0; i < 5; i++) queue.add(new int[]{mod, code});
+            queue.add(new int[]{0, 0});
+        }
+        pump();
+        if ("Screenshot".equals(label)) {
+            Toast.makeText(this, "Screenshot gaya. Laptop: Pictures > Screenshots",
+                    Toast.LENGTH_SHORT).show();
+        }
+    }
+
     private void setBg(View v, int color) {
         GradientDrawable g = new GradientDrawable();
         g.setColor(color);
@@ -449,17 +689,10 @@ public class MainActivity extends Activity {
         v.setBackground(g);
     }
 
+    // Gboard mode hides only the on-screen keys; mouse, scroll and shortcuts stay
     private void setMode(boolean gboard) {
         gboardMode = gboard;
-        int vis = gboard ? View.GONE : View.VISIBLE;
-        padRow.setVisibility(vis);
-        clickRow.setVisibility(vis);
-        kb.setVisibility(vis);
-        LinearLayout.LayoutParams lp = gboard
-                ? new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-                : new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(84));
-        lp.topMargin = dp(6);
-        boxRow.setLayoutParams(lp);
+        kb.setVisibility(gboard ? View.GONE : View.VISIBLE);
         box.setShowSoftInputOnFocus(gboard);
         modeBtn.setText(gboard ? "Keys" : "Gboard");
         final InputMethodManager imm =
@@ -500,7 +733,7 @@ public class MainActivity extends Activity {
         b.setText(key.label);
         b.setAllCaps(false);
         b.setTextColor(Color.WHITE);
-        b.setTextSize(key.label.length() > 3 ? 12 : 16);
+        b.setTextSize(key.label.length() > 2 ? 13 : 18);
         b.setMinWidth(0);
         b.setMinimumWidth(0);
         b.setMinHeight(0);
@@ -641,15 +874,19 @@ public class MainActivity extends Activity {
                 pumping = false;
                 return;
             }
-            send(a[0], a[1]);
-            handler.postDelayed(this, 6);
+            if (a[0] == -1) {
+                sendConsumer(a[1]);
+            } else {
+                send(a[0], a[1]);
+            }
+            H.postDelayed(this, 6);
         }
     };
 
     private void pump() {
         if (pumping) return;
         pumping = true;
-        handler.post(pumpRunnable);
+        H.post(pumpRunnable);
     }
 
     // ---------------- mouse ----------------
@@ -758,96 +995,74 @@ public class MainActivity extends Activity {
     }
 
     private void sendMouse(int x, int y, int wheel) {
-        if (hid == null || host == null) return;
+        if (sHid == null || sHost == null) return;
         byte[] r = new byte[4];
         r[0] = (byte) mouseButtons;
         r[1] = (byte) x;
         r[2] = (byte) y;
         r[3] = (byte) wheel;
-        hid.sendReport(host, 2, r);
+        sHid.sendReport(sHost, 2, r);
     }
 
     private void send(int modifiers, int code) {
-        if (hid == null || host == null) return;
+        if (sHid == null || sHost == null) return;
         byte[] r = new byte[8];
         r[0] = (byte) modifiers;
         r[2] = (byte) code;
-        hid.sendReport(host, 1, r);
+        sHid.sendReport(sHost, 1, r);
+    }
+
+    private void sendConsumer(int usage) {
+        if (sHid == null || sHost == null) return;
+        byte[] r = new byte[2];
+        r[0] = (byte) (usage & 0xFF);
+        r[1] = (byte) ((usage >> 8) & 0xFF);
+        sHid.sendReport(sHost, 3, r);
     }
 
     // ---------------- Bluetooth ----------------
 
     private void initHid() {
-        if (proxyRequested) return;
+        startKeepAlive();
+        if (sProxyRequested) {
+            updateStatus();
+            return;
+        }
         try {
             BluetoothManager bm = getSystemService(BluetoothManager.class);
-            adapter = bm == null ? null : bm.getAdapter();
-            if (adapter == null) {
+            sAdapter = bm == null ? null : bm.getAdapter();
+            if (sAdapter == null) {
                 status.setText("Is phone mein Bluetooth nahi hai");
                 return;
             }
-            if (!adapter.isEnabled()) {
+            if (!sAdapter.isEnabled()) {
                 status.setText("Pehle Bluetooth on karo, phir app dobara kholo");
                 return;
             }
-            proxyRequested = true;
-            adapter.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
-                @Override
-                public void onServiceConnected(int profile, BluetoothProfile proxy) {
-                    if (profile == BluetoothProfile.HID_DEVICE) {
-                        hid = (BluetoothHidDevice) proxy;
-                        registerKeyboard();
-                    }
-                }
-
-                @Override
-                public void onServiceDisconnected(int profile) {
-                    hid = null;
-                    registered = false;
-                    host = null;
-                    updateStatus();
-                }
-            }, BluetoothProfile.HID_DEVICE);
+            sProxyRequested = true;
+            sAdapter.getProfileProxy(sApp, PROXY_L, BluetoothProfile.HID_DEVICE);
         } catch (Throwable t) {
             status.setText("Bluetooth error: " + t);
         }
     }
 
-    private void registerKeyboard() {
+    private void startKeepAlive() {
         try {
-            BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
-                    "BT Keyboard", "Phone keyboard", "Hassan",
-                    BluetoothHidDevice.SUBCLASS1_COMBO, DESC);
-            hid.registerApp(sdp, null, null, getMainExecutor(),
-                    new BluetoothHidDevice.Callback() {
-                        @Override
-                        public void onAppStatusChanged(BluetoothDevice pluggedDevice,
-                                                       boolean reg) {
-                            registered = reg;
-                            updateStatus();
-                        }
-
-                        @Override
-                        public void onConnectionStateChanged(BluetoothDevice device,
-                                                             int state) {
-                            if (state == BluetoothProfile.STATE_CONNECTED) {
-                                host = device;
-                            } else if (state == BluetoothProfile.STATE_DISCONNECTED
-                                    && device.equals(host)) {
-                                host = null;
-                            }
-                            updateStatus();
-                        }
-                    });
-        } catch (Throwable t) {
-            status.setText("HID error: " + t);
+            Intent i = new Intent(this, KeepAliveService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
     private void updateStatus() {
-        if (host != null) {
-            status.setText("Connected: " + host.getName());
-        } else if (registered) {
+        if (status == null) return;
+        if (sHost != null) {
+            status.setText("Connected: " + sHost.getName());
+        } else if (sRegistered) {
             status.setText("Tayyar hai. 'Laptop chuno' dabao");
         } else {
             status.setText("Bluetooth keyboard shuru ho raha hai...");
@@ -861,11 +1076,11 @@ public class MainActivity extends Activity {
     }
 
     private void chooseHost() {
-        if (hid == null || adapter == null) {
+        if (sHid == null || sAdapter == null) {
             Toast.makeText(this, "Bluetooth abhi tayyar nahi", Toast.LENGTH_SHORT).show();
             return;
         }
-        final List<BluetoothDevice> list = new ArrayList<>(adapter.getBondedDevices());
+        final List<BluetoothDevice> list = new ArrayList<>(sAdapter.getBondedDevices());
         if (list.isEmpty()) {
             Toast.makeText(this, "Pehle laptop ko Bluetooth se pair karo",
                     Toast.LENGTH_LONG).show();
@@ -876,7 +1091,8 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("Laptop chuno")
                 .setItems(names, (d, i) -> {
-                    boolean ok = hid.connect(list.get(i));
+                    sRetries = 0;
+                    boolean ok = sHid.connect(list.get(i));
                     status.setText(ok ? "Connect ho raha hai..."
                             : "Connect nahi hua, dobara try karo");
                 })
@@ -886,13 +1102,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacksAndMessages(null);
-        if (hid != null) {
-            try {
-                hid.unregisterApp();
-                adapter.closeProfileProxy(BluetoothProfile.HID_DEVICE, hid);
-            } catch (Exception ignored) {
-            }
-        }
+        if (sUi == this) sUi = null;
+        H.removeCallbacks(pumpRunnable);
+        queue.clear();
+        pumping = false;
+        // Bluetooth is NOT closed here, so the laptop stays connected
     }
 }
