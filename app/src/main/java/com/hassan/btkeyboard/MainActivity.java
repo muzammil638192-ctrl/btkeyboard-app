@@ -41,7 +41,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -85,11 +85,36 @@ public class MainActivity extends Activity {
             0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
             0xC0);
 
-    private static final int C_NORMAL = 0xFF2C2C2E;
-    private static final int C_MOD = 0xFF3F3F46;
-    private static final int C_PRESSED = 0xFF6B6B73;
-    private static final int C_ACTIVE = 0xFF0A84FF;
-    private static final int C_GREEN = 0xFF30A46C;
+    // themes: bg, key, mod, pressed, accent, green, text, pad, box, hint
+    private static final int[][] THEMES = {
+            {0xFF121212, 0xFF2C2C2E, 0xFF3F3F46, 0xFF6B6B73, 0xFF0A84FF, 0xFF30A46C,
+                    0xFFFFFFFF, 0xFF1C3A4D, 0xFF1E1E22, 0xFF8E8E93},
+            {0xFFE5E5EA, 0xFFFFFFFF, 0xFFC7C7CC, 0xFF9A9AA0, 0xFF007AFF, 0xFF34C759,
+                    0xFF111111, 0xFFBFD9F2, 0xFFFFFFFF, 0xFF8E8E93},
+            {0xFF0B1B2B, 0xFF16324A, 0xFF21486A, 0xFF3A6E9C, 0xFF1EA7FD, 0xFF2BC48A,
+                    0xFFEAF6FF, 0xFF0F3A57, 0xFF10283D, 0xFF6F8CA6},
+            {0xFF000000, 0xFF1A1A1A, 0xFF2A2A2A, 0xFF555555, 0xFFFF7A00, 0xFF00C853,
+                    0xFFFFFFFF, 0xFF161616, 0xFF101010, 0xFF777777},
+            {0xFF1A1325, 0xFF2E2347, 0xFF45336B, 0xFF6D55A3, 0xFFA855F7, 0xFF22C55E,
+                    0xFFF5EEFF, 0xFF2B1F4A, 0xFF241A38, 0xFF8C7BA8}
+    };
+    private static final String[] THEME_NAMES = {"Dark", "Light", "Ocean", "AMOLED", "Purple"};
+    private int theme = 0;
+    private int cBg, cKey, cMod, cPressed, cAccent, cGreen, cText, cPad, cBox, cHint;
+
+    private void loadTheme() {
+        theme = getSharedPreferences("ui", MODE_PRIVATE).getInt("theme", 0) % THEMES.length;
+        int[] t = THEMES[theme];
+        cBg = t[0]; cKey = t[1]; cMod = t[2]; cPressed = t[3]; cAccent = t[4];
+        cGreen = t[5]; cText = t[6]; cPad = t[7]; cBox = t[8]; cHint = t[9];
+    }
+
+    private void nextTheme() {
+        int n = (theme + 1) % THEMES.length;
+        getSharedPreferences("ui", MODE_PRIVATE).edit().putInt("theme", n).apply();
+        Toast.makeText(this, "Theme: " + THEME_NAMES[n], Toast.LENGTH_SHORT).show();
+        recreate();
+    }
 
     private static final int M_CTRL = 0x01, M_SHIFT = 0x02, M_ALT = 0x04, M_WIN = 0x08;
     private static final float SENS = 1.8f;
@@ -288,9 +313,9 @@ public class MainActivity extends Activity {
 
     private TextView status;
     private EditText box;
-    private Button modeBtn;
-    private LinearLayout boxRow, padRow, clickRow, kb;
-    private boolean gboardMode = false;
+    private Button[] tabBtns;
+    private LinearLayout boxRow, kb, gboardPage, mousePage;
+    private int tab = 0;
     private boolean suppress = false;
     private String prev = "";
 
@@ -373,6 +398,7 @@ public class MainActivity extends Activity {
         }
 
         try {
+            loadTheme();
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             buildUi();
             sUi = this;
@@ -452,11 +478,11 @@ public class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xFF121212);
+        root.setBackgroundColor(cBg);
         root.setPadding(dp(2), dp(6), dp(2), dp(6));
 
         status = new TextView(this);
-        status.setTextColor(Color.WHITE);
+        status.setTextColor(cText);
         status.setTextSize(13);
         status.setPadding(dp(8), dp(2), dp(8), dp(2));
         status.setText("Shuru ho raha hai...");
@@ -466,27 +492,41 @@ public class MainActivity extends Activity {
         // top bar
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.addView(barButton("Visible", C_ACTIVE, v -> makeVisible()), barLp());
-        bar.addView(barButton("Laptop chuno", C_ACTIVE, v -> chooseHost()), barLp());
-        modeBtn = barButton("Gboard", C_GREEN, v -> setMode(!gboardMode));
-        bar.addView(modeBtn, barLp());
+        bar.addView(barButton("Visible", cAccent, v -> makeVisible()), barLp());
+        bar.addView(barButton("Laptop chuno", cAccent, v -> chooseHost()), barLp());
+        bar.addView(barButton("Theme", cMod, v -> nextTheme()), barLp());
         root.addView(bar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
 
-        // text box + paste / clear
+        // tabs
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        String[] tabNames = {"Keys", "Gboard", "Mouse"};
+        tabBtns = new Button[3];
+        for (int i = 0; i < 3; i++) {
+            final int idx = i;
+            tabBtns[i] = barButton(tabNames[i], cMod, v -> setTab(idx));
+            tabs.addView(tabBtns[i], barLp());
+        }
+        LinearLayout.LayoutParams tabsLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(40));
+        tabsLp.topMargin = dp(4);
+        root.addView(tabs, tabsLp);
+
+        // text box + paste / clear (Keys and Gboard tabs)
         boxRow = new LinearLayout(this);
         boxRow.setOrientation(LinearLayout.HORIZONTAL);
 
         box = new EditText(this);
         box.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         box.setHint("Yahan likha nazar aayega. Paste bhi kar sakte ho");
-        box.setHintTextColor(0xFF8E8E93);
-        box.setTextColor(Color.WHITE);
+        box.setHintTextColor(cHint);
+        box.setTextColor(cText);
         box.setTextSize(16);
         box.setGravity(Gravity.TOP | Gravity.START);
         box.setPadding(dp(10), dp(6), dp(10), dp(6));
         box.setShowSoftInputOnFocus(false);
-        setBg(box, 0xFF1E1E22);
+        setBg(box, cBox);
         box.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
@@ -511,8 +551,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         sLp.setMargins(0, dp(2), 0, dp(2));
-        side.addView(barButton("Paste", C_MOD, v -> pasteText()), sLp);
-        side.addView(barButton("Clear", C_MOD, v -> clearBox()), sLp);
+        side.addView(barButton("Paste", cMod, v -> pasteText()), sLp);
+        side.addView(barButton("Clear", cMod, v -> clearBox()), sLp);
         boxRow.addView(side, new LinearLayout.LayoutParams(
                 dp(72), LinearLayout.LayoutParams.MATCH_PARENT));
 
@@ -521,76 +561,17 @@ public class MainActivity extends Activity {
         boxRowLp.topMargin = dp(4);
         root.addView(boxRow, boxRowLp);
 
-        // shortcut strip (scrolls sideways)
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        LinearLayout shortRow = new LinearLayout(this);
-        shortRow.setOrientation(LinearLayout.HORIZONTAL);
-        addShortcut(shortRow, "Screenshot", C_GREEN, M_WIN, 0x46, 0);
-        addShortcut(shortRow, "Snip", C_GREEN, M_WIN | M_SHIFT, 0x16, 0);
-        addShortcut(shortRow, "Copy", C_MOD, M_CTRL, 0x06, 0);
-        addShortcut(shortRow, "Paste", C_MOD, M_CTRL, 0x19, 0);
-        addShortcut(shortRow, "Cut", C_MOD, M_CTRL, 0x1B, 0);
-        addShortcut(shortRow, "Undo", C_MOD, M_CTRL, 0x1D, 0);
-        addShortcut(shortRow, "All", C_MOD, M_CTRL, 0x04, 0);
-        addShortcut(shortRow, "Save", C_MOD, M_CTRL, 0x16, 0);
-        addShortcut(shortRow, "Alt+Tab", C_MOD, M_ALT, 0x2B, 0);
-        addShortcut(shortRow, "Desktop", C_MOD, M_WIN, 0x07, 0);
-        addShortcut(shortRow, "Lock", C_MOD, M_WIN, 0x0F, 0);
-        addShortcut(shortRow, "Task Mgr", C_MOD, M_CTRL | M_SHIFT, 0x29, 0);
-        addShortcut(shortRow, "Vol -", C_MOD, 0, 0, 0xEA);
-        addShortcut(shortRow, "Vol +", C_MOD, 0, 0, 0xE9);
-        addShortcut(shortRow, "Mute", C_MOD, 0, 0, 0xE2);
-        addShortcut(shortRow, "Play/Pause", C_MOD, 0, 0, 0xCD);
-        hs.addView(shortRow);
-        LinearLayout.LayoutParams hsLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(38));
-        hsLp.topMargin = dp(4);
-        root.addView(hs, hsLp);
+        FrameLayout content = new FrameLayout(this);
+        LinearLayout.LayoutParams contentLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        contentLp.topMargin = dp(4);
+        root.addView(content, contentLp);
 
-        // touchpad + scroll strip
-        padRow = new LinearLayout(this);
-        padRow.setOrientation(LinearLayout.HORIZONTAL);
-        View pad = new View(this);
-        setBg(pad, 0xFF1C3A4D);
-        pad.setOnTouchListener(padListener());
-        LinearLayout.LayoutParams padLp = new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
-        padLp.setMargins(dp(2), dp(2), dp(2), dp(2));
-        padRow.addView(pad, padLp);
-        TextView scrollStrip = new TextView(this);
-        scrollStrip.setText("\u2195");
-        scrollStrip.setTextColor(Color.WHITE);
-        scrollStrip.setTextSize(22);
-        scrollStrip.setGravity(Gravity.CENTER);
-        setBg(scrollStrip, C_NORMAL);
-        scrollStrip.setOnTouchListener(scrollListener());
-        LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
-                dp(52), LinearLayout.LayoutParams.MATCH_PARENT);
-        stripLp.setMargins(dp(2), dp(2), dp(2), dp(2));
-        padRow.addView(scrollStrip, stripLp);
-        LinearLayout.LayoutParams padRowLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.8f);
-        padRowLp.topMargin = dp(4);
-        root.addView(padRow, padRowLp);
-
-        // click buttons
-        clickRow = new LinearLayout(this);
-        clickRow.setOrientation(LinearLayout.HORIZONTAL);
-        clickRow.addView(clickButton("Left Click", 1), barLp());
-        clickRow.addView(clickButton("Right Click", 2), barLp());
-        LinearLayout.LayoutParams clickLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
-        clickLp.topMargin = dp(2);
-        root.addView(clickRow, clickLp);
-
-        // keyboard
+        // ---- page 0: on-screen keyboard ----
         kb = new LinearLayout(this);
         kb.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams kbLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 4.6f);
-        kbLp.topMargin = dp(4);
-        root.addView(kb, kbLp);
+        content.addView(kb, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         List<K[]> rows = new ArrayList<>();
         rows.add(new K[]{k("Esc", 0x29), k("F1", 0x3A), k("F2", 0x3B), k("F3", 0x3C),
@@ -629,7 +610,100 @@ public class MainActivity extends Activity {
                     LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         }
 
+        // ---- page 1: Gboard (touchpad stays available) ----
+        gboardPage = new LinearLayout(this);
+        gboardPage.setOrientation(LinearLayout.VERTICAL);
+        gboardPage.addView(buildPadRow(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        gboardPage.addView(buildClickRow(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        content.addView(gboardPage, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // ---- page 2: mouse + shortcuts ----
+        mousePage = new LinearLayout(this);
+        mousePage.setOrientation(LinearLayout.VERTICAL);
+        mousePage.addView(buildPadRow(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        mousePage.addView(buildClickRow(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
+
+        LinearLayout grid = new LinearLayout(this);
+        grid.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout g1 = shortRow(grid);
+        addShortcut(g1, "Screenshot", cGreen, M_WIN, 0x46, 0);
+        addShortcut(g1, "Snip", cGreen, M_WIN | M_SHIFT, 0x16, 0);
+        addShortcut(g1, "Desktop", cMod, M_WIN, 0x07, 0);
+        addShortcut(g1, "Lock", cMod, M_WIN, 0x0F, 0);
+        LinearLayout g2 = shortRow(grid);
+        addShortcut(g2, "Copy", cMod, M_CTRL, 0x06, 0);
+        addShortcut(g2, "Paste", cMod, M_CTRL, 0x19, 0);
+        addShortcut(g2, "Cut", cMod, M_CTRL, 0x1B, 0);
+        addShortcut(g2, "Undo", cMod, M_CTRL, 0x1D, 0);
+        LinearLayout g3 = shortRow(grid);
+        addShortcut(g3, "All", cMod, M_CTRL, 0x04, 0);
+        addShortcut(g3, "Save", cMod, M_CTRL, 0x16, 0);
+        addShortcut(g3, "Alt+Tab", cMod, M_ALT, 0x2B, 0);
+        addShortcut(g3, "Task Mgr", cMod, M_CTRL | M_SHIFT, 0x29, 0);
+        LinearLayout g4 = shortRow(grid);
+        addShortcut(g4, "Vol -", cMod, 0, 0, 0xEA);
+        addShortcut(g4, "Vol +", cMod, 0, 0, 0xE9);
+        addShortcut(g4, "Mute", cMod, 0, 0, 0xE2);
+        addShortcut(g4, "Play/Pause", cMod, 0, 0, 0xCD);
+        LinearLayout g5 = shortRow(grid);
+        addShortcut(g5, "Lang", cMod, M_WIN, 0x2C, 0);
+        addShortcut(g5, "Close", cMod, M_ALT, 0x3D, 0);
+        addShortcut(g5, "Start", cMod, M_WIN, 0, 0);
+        addShortcut(g5, "Refresh", cMod, 0, 0x3E, 0);
+        LinearLayout.LayoutParams gridLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.3f);
+        gridLp.topMargin = dp(4);
+        mousePage.addView(grid, gridLp);
+        content.addView(mousePage, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
         setContentView(root);
+        setTab(0);
+    }
+
+    private LinearLayout buildPadRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        View pad = new View(this);
+        setBg(pad, cPad);
+        pad.setOnTouchListener(padListener());
+        LinearLayout.LayoutParams padLp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        padLp.setMargins(dp(2), dp(2), dp(2), dp(2));
+        row.addView(pad, padLp);
+        TextView scrollStrip = new TextView(this);
+        scrollStrip.setText("\u2195");
+        scrollStrip.setTextColor(cText);
+        scrollStrip.setTextSize(22);
+        scrollStrip.setGravity(Gravity.CENTER);
+        setBg(scrollStrip, cKey);
+        scrollStrip.setOnTouchListener(scrollListener());
+        LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
+                dp(52), LinearLayout.LayoutParams.MATCH_PARENT);
+        stripLp.setMargins(dp(2), dp(2), dp(2), dp(2));
+        row.addView(scrollStrip, stripLp);
+        return row;
+    }
+
+    private LinearLayout buildClickRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(clickButton("Left Click", 1), barLp());
+        row.addView(clickButton("Right Click", 2), barLp());
+        return row;
+    }
+
+    private LinearLayout shortRow(LinearLayout parent) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        parent.addView(r, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        return r;
     }
 
     private LinearLayout.LayoutParams barLp() {
@@ -643,7 +717,7 @@ public class MainActivity extends Activity {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
+        b.setTextColor((color == cMod || color == cKey) ? cText : Color.WHITE);
         b.setTextSize(14);
         b.setMinWidth(0);
         b.setMinimumWidth(0);
@@ -659,11 +733,10 @@ public class MainActivity extends Activity {
     private void addShortcut(LinearLayout row, String label, int color,
                              final int mod, final int code, final int usage) {
         Button b = barButton(label, color, v -> runShortcut(label, mod, code, usage));
-        b.setTextSize(13);
-        b.setPadding(dp(12), 0, dp(12), 0);
+        b.setTextSize(14);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT);
-        lp.setMargins(dp(2), 0, dp(2), 0);
+                0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        lp.setMargins(dp(2), dp(2), dp(2), dp(2));
         row.addView(b, lp);
     }
 
@@ -689,20 +762,26 @@ public class MainActivity extends Activity {
         v.setBackground(g);
     }
 
-    // Gboard mode hides only the on-screen keys; mouse, scroll and shortcuts stay
-    private void setMode(boolean gboard) {
-        gboardMode = gboard;
-        kb.setVisibility(gboard ? View.GONE : View.VISIBLE);
-        box.setShowSoftInputOnFocus(gboard);
-        modeBtn.setText(gboard ? "Keys" : "Gboard");
+    // tabs: 0 = Keys, 1 = Gboard (+touchpad), 2 = Mouse + shortcuts
+    private void setTab(int t) {
+        tab = t;
+        kb.setVisibility(t == 0 ? View.VISIBLE : View.GONE);
+        gboardPage.setVisibility(t == 1 ? View.VISIBLE : View.GONE);
+        mousePage.setVisibility(t == 2 ? View.VISIBLE : View.GONE);
+        boxRow.setVisibility(t == 2 ? View.GONE : View.VISIBLE);
+        box.setShowSoftInputOnFocus(t == 1);
         final InputMethodManager imm =
                 (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-        if (gboard) {
+        if (t == 1) {
             box.requestFocus();
             box.post(() -> imm.showSoftInput(box, InputMethodManager.SHOW_IMPLICIT));
         } else {
             imm.hideSoftInputFromWindow(box.getWindowToken(), 0);
             box.clearFocus();
+        }
+        for (int i = 0; i < tabBtns.length; i++) {
+            setBg(tabBtns[i], i == t ? cAccent : cMod);
+            tabBtns[i].setTextColor(i == t ? Color.WHITE : cText);
         }
     }
 
@@ -732,15 +811,15 @@ public class MainActivity extends Activity {
         final Button b = new Button(this);
         b.setText(key.label);
         b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
-        b.setTextSize(key.label.length() > 2 ? 13 : 18);
+        b.setTextColor(cText);
+        b.setTextSize(key.label.length() > 2 ? 13 : (key.label.length() == 2 ? 17 : 20));
         b.setMinWidth(0);
         b.setMinimumWidth(0);
         b.setMinHeight(0);
         b.setMinimumHeight(0);
         b.setPadding(0, 0, 0, 0);
         b.setStateListAnimator(null);
-        setBg(b, key.mod != 0 ? C_MOD : C_NORMAL);
+        setBg(b, key.mod != 0 ? cMod : cKey);
 
         if (key.mod != 0) {
             modButtons.add(b);
@@ -754,7 +833,7 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_DOWN:
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                     if (key.mod == 0) {
-                        setBg(b, C_PRESSED);
+                        setBg(b, cPressed);
                         send(mods, key.code);
                         echo(key.code);
                     }
@@ -766,7 +845,7 @@ public class MainActivity extends Activity {
                         refreshMods();
                     } else {
                         send(mods, 0);
-                        setBg(b, C_NORMAL);
+                        setBg(b, cKey);
                         if (mods != 0) {
                             mods = 0;
                             send(0, 0);
@@ -777,7 +856,7 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_CANCEL:
                     if (key.mod == 0) {
                         send(mods, 0);
-                        setBg(b, C_NORMAL);
+                        setBg(b, cKey);
                     }
                     return true;
                 default:
@@ -812,7 +891,7 @@ public class MainActivity extends Activity {
     private void refreshMods() {
         for (int i = 0; i < modButtons.size(); i++) {
             boolean on = (mods & modKeys.get(i).mod) != 0;
-            setBg(modButtons.get(i), on ? C_ACTIVE : C_MOD);
+            setBg(modButtons.get(i), on ? cAccent : cMod);
         }
         boolean shift = (mods & M_SHIFT) != 0;
         for (Button b : letterButtons) {
@@ -895,21 +974,21 @@ public class MainActivity extends Activity {
         final Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
+        b.setTextColor(cText);
         b.setTextSize(15);
         b.setStateListAnimator(null);
-        setBg(b, C_MOD);
+        setBg(b, cMod);
         b.setOnTouchListener((v, e) -> {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-                    setBg(b, C_ACTIVE);
+                    setBg(b, cAccent);
                     mouseButtons |= mask;
                     sendMouse(0, 0, 0);
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
-                    setBg(b, C_MOD);
+                    setBg(b, cMod);
                     mouseButtons &= ~mask;
                     sendMouse(0, 0, 0);
                     return true;
