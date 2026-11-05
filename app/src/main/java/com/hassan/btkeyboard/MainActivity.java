@@ -21,9 +21,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Icon;
+import android.graphics.drawable.LayerDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -44,6 +48,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -51,6 +56,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Executor;
 
 @SuppressLint("MissingPermission")
@@ -100,24 +106,24 @@ public class MainActivity extends Activity {
     };
     private static final String[] THEME_NAMES = {"Dark", "Light", "Ocean", "AMOLED", "Purple"};
     private int theme = 0;
-    private int cBg, cKey, cMod, cPressed, cAccent, cGreen, cText, cPad, cBox, cHint;
+    private int cBg, cKey, cMod, cPressed, cAccent, cGreen, cText, cPad, cBox, cHint, cStroke;
+    private float sens = 1.8f;
 
     private void loadTheme() {
         theme = getSharedPreferences("ui", MODE_PRIVATE).getInt("theme", 0) % THEMES.length;
+        sens = getSharedPreferences("ui", MODE_PRIVATE).getInt("sens", 18) / 10f;
         int[] t = THEMES[theme];
         cBg = t[0]; cKey = t[1]; cMod = t[2]; cPressed = t[3]; cAccent = t[4];
         cGreen = t[5]; cText = t[6]; cPad = t[7]; cBox = t[8]; cHint = t[9];
+        cStroke = (cText & 0x00FFFFFF) | 0x24000000;
     }
 
-    private void nextTheme() {
-        int n = (theme + 1) % THEMES.length;
-        getSharedPreferences("ui", MODE_PRIVATE).edit().putInt("theme", n).apply();
-        Toast.makeText(this, "Theme: " + THEME_NAMES[n], Toast.LENGTH_SHORT).show();
+    private void applyTheme(int idx) {
+        getSharedPreferences("ui", MODE_PRIVATE).edit().putInt("theme", idx).apply();
         recreate();
     }
 
     private static final int M_CTRL = 0x01, M_SHIFT = 0x02, M_ALT = 0x04, M_WIN = 0x08;
-    private static final float SENS = 1.8f;
 
     // char <-> HID key table (US layout)
     private static final HashMap<Character, int[]> CHARS = new HashMap<>();
@@ -312,9 +318,12 @@ public class MainActivity extends Activity {
     private boolean padMoved;
 
     private TextView status;
+    private View dot;
     private EditText box;
     private Button[] tabBtns;
-    private LinearLayout boxRow, kb, gboardPage, mousePage;
+    private LinearLayout boxRow, kb, gboardPage, mousePage, mainRoot;
+    private View settingsRoot;
+    private boolean settingsOpen = false;
     private int tab = 0;
     private boolean suppress = false;
     private String prev = "";
@@ -374,6 +383,72 @@ public class MainActivity extends Activity {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
 
+    // ---------------- colour / drawable helpers ----------------
+
+    private static int adj(int c, float f) {
+        int a = c & 0xFF000000;
+        int r = Math.min(255, Math.max(0, Math.round(((c >> 16) & 0xFF) * f)));
+        int g = Math.min(255, Math.max(0, Math.round(((c >> 8) & 0xFF) * f)));
+        int b = Math.min(255, Math.max(0, Math.round((c & 0xFF) * f)));
+        return a | (r << 16) | (g << 8) | b;
+    }
+
+    private static int blend(int a, int b, float t) {
+        int r = (int) (((a >> 16) & 0xFF) * (1 - t) + ((b >> 16) & 0xFF) * t);
+        int g = (int) (((a >> 8) & 0xFF) * (1 - t) + ((b >> 8) & 0xFF) * t);
+        int bl = (int) ((a & 0xFF) * (1 - t) + (b & 0xFF) * t);
+        return 0xFF000000 | (r << 16) | (g << 8) | bl;
+    }
+
+    private Typeface medium() {
+        return Typeface.create("sans-serif-medium", Typeface.NORMAL);
+    }
+
+    // soft page background with a faint accent glow at the top
+    private void setPageBg(View v) {
+        GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{blend(cBg, cAccent, 0.14f), cBg});
+        v.setBackground(g);
+    }
+
+    // flat rounded fill
+    private void setBg(View v, int color) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(10));
+        v.setBackground(g);
+    }
+
+    // rounded card with a thin border
+    private void setCardBg(View v, int color, int radiusDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(radiusDp));
+        g.setStroke(dp(1), cStroke);
+        v.setBackground(g);
+    }
+
+    // 3D key look: lighter face on a darker base
+    private void setKeyBg(View v, int color) {
+        GradientDrawable base = new GradientDrawable();
+        base.setColor(adj(color, 0.70f));
+        base.setCornerRadius(dp(10));
+        GradientDrawable face = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{adj(color, 1.14f), color});
+        face.setCornerRadius(dp(10));
+        LayerDrawable ld = new LayerDrawable(new Drawable[]{base, face});
+        ld.setLayerInset(1, 0, 0, 0, dp(2));
+        v.setBackground(ld);
+    }
+
+    private void setDotColor(int color) {
+        if (dot == null) return;
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(color);
+        dot.setBackground(g);
+    }
+
     // ---------------- lifecycle ----------------
 
     @Override
@@ -402,6 +477,9 @@ public class MainActivity extends Activity {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             buildUi();
             sUi = this;
+            if (savedInstanceState != null && savedInstanceState.getBoolean("settings", false)) {
+                openSettings();
+            }
             List<String> need = new ArrayList<>();
             if (Build.VERSION.SDK_INT >= 31
                     && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -420,6 +498,21 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable t) {
             showCrash(Log.getStackTraceString(t));
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putBoolean("settings", settingsOpen);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (settingsOpen) {
+            closeSettings();
+        } else {
+            super.onBackPressed();
         }
     }
 
@@ -473,34 +566,41 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------------- UI ----------------
+    // ---------------- main UI ----------------
 
     private void buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(cBg);
-        root.setPadding(dp(2), dp(6), dp(2), dp(6));
+        mainRoot = new LinearLayout(this);
+        mainRoot.setOrientation(LinearLayout.VERTICAL);
+        setPageBg(mainRoot);
+        mainRoot.setPadding(dp(6), dp(8), dp(6), dp(8));
 
+        // header: status dot + status text + settings icon
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        dot = new View(this);
+        setDotColor(0xFF8E8E93);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(10), dp(10));
+        dotLp.setMargins(dp(8), 0, dp(8), 0);
+        header.addView(dot, dotLp);
         status = new TextView(this);
         status.setTextColor(cText);
-        status.setTextSize(13);
-        status.setPadding(dp(8), dp(2), dp(8), dp(2));
+        status.setTextSize(14);
+        status.setTypeface(medium());
+        status.setMaxLines(2);
         status.setText("Shuru ho raha hai...");
-        root.addView(status, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        header.addView(status, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(iconButton("\u2699", v -> openSettings()),
+                new LinearLayout.LayoutParams(dp(44), dp(44)));
+        mainRoot.addView(header, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(50)));
 
-        // top bar
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.addView(barButton("Visible", cAccent, v -> makeVisible()), barLp());
-        bar.addView(barButton("Laptop chuno", cAccent, v -> chooseHost()), barLp());
-        bar.addView(barButton("Theme", cMod, v -> nextTheme()), barLp());
-        root.addView(bar, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
-
-        // tabs
+        // tabs (segmented control)
         LinearLayout tabs = new LinearLayout(this);
         tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setPadding(dp(3), dp(3), dp(3), dp(3));
+        setCardBg(tabs, cBox, 14);
         String[] tabNames = {"Keys", "Gboard", "Mouse"};
         tabBtns = new Button[3];
         for (int i = 0; i < 3; i++) {
@@ -509,9 +609,9 @@ public class MainActivity extends Activity {
             tabs.addView(tabBtns[i], barLp());
         }
         LinearLayout.LayoutParams tabsLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(40));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(46));
         tabsLp.topMargin = dp(4);
-        root.addView(tabs, tabsLp);
+        mainRoot.addView(tabs, tabsLp);
 
         // text box + paste / clear (Keys and Gboard tabs)
         boxRow = new LinearLayout(this);
@@ -524,9 +624,9 @@ public class MainActivity extends Activity {
         box.setTextColor(cText);
         box.setTextSize(16);
         box.setGravity(Gravity.TOP | Gravity.START);
-        box.setPadding(dp(10), dp(6), dp(10), dp(6));
+        box.setPadding(dp(12), dp(8), dp(12), dp(8));
         box.setShowSoftInputOnFocus(false);
-        setBg(box, cBox);
+        setCardBg(box, cBox, 14);
         box.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
@@ -557,15 +657,15 @@ public class MainActivity extends Activity {
                 dp(72), LinearLayout.LayoutParams.MATCH_PARENT));
 
         LinearLayout.LayoutParams boxRowLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(66));
         boxRowLp.topMargin = dp(4);
-        root.addView(boxRow, boxRowLp);
+        mainRoot.addView(boxRow, boxRowLp);
 
         FrameLayout content = new FrameLayout(this);
         LinearLayout.LayoutParams contentLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         contentLp.topMargin = dp(4);
-        root.addView(content, contentLp);
+        mainRoot.addView(content, contentLp);
 
         // ---- page 0: on-screen keyboard ----
         kb = new LinearLayout(this);
@@ -603,7 +703,7 @@ public class MainActivity extends Activity {
                 Button b = makeKey(key);
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
                         LinearLayout.LayoutParams.MATCH_PARENT, key.w);
-                lp.setMargins(dp(1), dp(2), dp(1), dp(2));
+                lp.setMargins(dp(2), dp(2), dp(2), dp(2));
                 r.addView(b, lp);
             }
             kb.addView(r, new LinearLayout.LayoutParams(
@@ -662,15 +762,28 @@ public class MainActivity extends Activity {
         content.addView(mousePage, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        setContentView(root);
+        // settings screen sits on top of the main screen
+        settingsRoot = buildSettings();
+        settingsRoot.setVisibility(View.GONE);
+        FrameLayout rootFrame = new FrameLayout(this);
+        rootFrame.addView(mainRoot, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        rootFrame.addView(settingsRoot, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        setContentView(rootFrame);
         setTab(0);
     }
 
     private LinearLayout buildPadRow() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        View pad = new View(this);
-        setBg(pad, cPad);
+        TextView pad = new TextView(this);
+        pad.setText("TOUCHPAD");
+        pad.setTextColor(cHint);
+        pad.setTextSize(11);
+        pad.setLetterSpacing(0.25f);
+        pad.setGravity(Gravity.CENTER);
+        setCardBg(pad, cPad, 16);
         pad.setOnTouchListener(padListener());
         LinearLayout.LayoutParams padLp = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
@@ -681,7 +794,7 @@ public class MainActivity extends Activity {
         scrollStrip.setTextColor(cText);
         scrollStrip.setTextSize(22);
         scrollStrip.setGravity(Gravity.CENTER);
-        setBg(scrollStrip, cKey);
+        setKeyBg(scrollStrip, cKey);
         scrollStrip.setOnTouchListener(scrollListener());
         LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
                 dp(52), LinearLayout.LayoutParams.MATCH_PARENT);
@@ -719,14 +832,21 @@ public class MainActivity extends Activity {
         b.setAllCaps(false);
         b.setTextColor((color == cMod || color == cKey) ? cText : Color.WHITE);
         b.setTextSize(14);
+        b.setTypeface(medium());
         b.setMinWidth(0);
         b.setMinimumWidth(0);
         b.setMinHeight(0);
         b.setMinimumHeight(0);
         b.setPadding(dp(4), 0, dp(4), 0);
         b.setStateListAnimator(null);
-        setBg(b, color);
+        setKeyBg(b, color);
         b.setOnClickListener(l);
+        return b;
+    }
+
+    private Button iconButton(String glyph, View.OnClickListener l) {
+        Button b = barButton(glyph, cMod, l);
+        b.setTextSize(20);
         return b;
     }
 
@@ -755,13 +875,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void setBg(View v, int color) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(color);
-        g.setCornerRadius(dp(8));
-        v.setBackground(g);
-    }
-
     // tabs: 0 = Keys, 1 = Gboard (+touchpad), 2 = Mouse + shortcuts
     private void setTab(int t) {
         tab = t;
@@ -780,10 +893,245 @@ public class MainActivity extends Activity {
             box.clearFocus();
         }
         for (int i = 0; i < tabBtns.length; i++) {
-            setBg(tabBtns[i], i == t ? cAccent : cMod);
-            tabBtns[i].setTextColor(i == t ? Color.WHITE : cText);
+            if (i == t) {
+                GradientDrawable g = new GradientDrawable(
+                        GradientDrawable.Orientation.TOP_BOTTOM,
+                        new int[]{adj(cAccent, 1.18f), cAccent});
+                g.setCornerRadius(dp(11));
+                tabBtns[i].setBackground(g);
+                tabBtns[i].setTextColor(Color.WHITE);
+            } else {
+                tabBtns[i].setBackgroundColor(Color.TRANSPARENT);
+                tabBtns[i].setTextColor(cText);
+            }
         }
     }
+
+    // ---------------- settings screen ----------------
+
+    private void openSettings() {
+        settingsOpen = true;
+        InputMethodManager imm =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        imm.hideSoftInputFromWindow(box.getWindowToken(), 0);
+        mainRoot.setVisibility(View.GONE);
+        settingsRoot.setVisibility(View.VISIBLE);
+    }
+
+    private void closeSettings() {
+        settingsOpen = false;
+        settingsRoot.setVisibility(View.GONE);
+        mainRoot.setVisibility(View.VISIBLE);
+        setTab(tab);
+    }
+
+    private View buildSettings() {
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(12), dp(10), dp(12), dp(10));
+        setPageBg(page);
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(iconButton("\u2190", v -> closeSettings()),
+                new LinearLayout.LayoutParams(dp(44), dp(44)));
+        TextView title = new TextView(this);
+        title.setText("Settings");
+        title.setTextColor(cText);
+        title.setTextSize(22);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setPadding(dp(14), 0, 0, 0);
+        top.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        page.addView(top, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+
+        ScrollView sv = new ScrollView(this);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        sv.addView(col);
+        page.addView(sv, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // connection
+        col.addView(sectionLabel("CONNECTION"));
+        LinearLayout c1 = card();
+        c1.addView(settingRow("Laptop se connect karo", "Pair ki hui laptop chuno",
+                barButton("Connect", cAccent, v -> chooseHost())));
+        c1.addView(divider());
+        c1.addView(settingRow("Phone visible karo", "Laptop se pairing ke liye 2 minute",
+                barButton("Visible", cAccent, v -> makeVisible())));
+        col.addView(c1, cardLp());
+
+        // theme
+        col.addView(sectionLabel("THEME"));
+        LinearLayout c2 = card();
+        LinearLayout sw = new LinearLayout(this);
+        sw.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < THEMES.length; i++) {
+            final int idx = i;
+            LinearLayout one = new LinearLayout(this);
+            one.setOrientation(LinearLayout.VERTICAL);
+            one.setGravity(Gravity.CENTER_HORIZONTAL);
+            View chip = new View(this);
+            chip.setBackground(swatch(i, i == theme));
+            chip.setOnClickListener(v -> applyTheme(idx));
+            one.addView(chip, new LinearLayout.LayoutParams(dp(46), dp(46)));
+            TextView nm = new TextView(this);
+            nm.setText(THEME_NAMES[i]);
+            nm.setTextSize(11);
+            nm.setTextColor(i == theme ? cText : cHint);
+            nm.setGravity(Gravity.CENTER);
+            nm.setPadding(0, dp(6), 0, 0);
+            one.addView(nm);
+            sw.addView(one, new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        c2.addView(sw);
+        col.addView(c2, cardLp());
+
+        // mouse speed
+        col.addView(sectionLabel("MOUSE"));
+        LinearLayout c3 = card();
+        LinearLayout speedHead = new LinearLayout(this);
+        speedHead.setOrientation(LinearLayout.HORIZONTAL);
+        TextView sName = new TextView(this);
+        sName.setText("Mouse speed");
+        sName.setTextColor(cText);
+        sName.setTextSize(15);
+        sName.setTypeface(medium());
+        speedHead.addView(sName, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        final TextView sVal = new TextView(this);
+        sVal.setTextColor(cHint);
+        sVal.setTextSize(14);
+        sVal.setText(String.format(Locale.US, "%.1fx", sens));
+        speedHead.addView(sVal);
+        c3.addView(speedHead);
+        SeekBar sb = new SeekBar(this);
+        sb.setMax(35);
+        sb.setProgress(Math.round(sens * 10) - 5);
+        sb.setProgressTintList(ColorStateList.valueOf(cAccent));
+        sb.setThumbTintList(ColorStateList.valueOf(cAccent));
+        sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                sens = (p + 5) / 10f;
+                sVal.setText(String.format(Locale.US, "%.1fx", sens));
+                if (fromUser) {
+                    getSharedPreferences("ui", MODE_PRIVATE).edit()
+                            .putInt("sens", p + 5).apply();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar s) { }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar s) { }
+        });
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        sbLp.topMargin = dp(8);
+        c3.addView(sb, sbLp);
+        col.addView(c3, cardLp());
+
+        // stop
+        col.addView(sectionLabel("BLUETOOTH"));
+        LinearLayout c4 = card();
+        c4.addView(settingRow("Connection band karo",
+                "App band hogi, laptop disconnect ho jayega",
+                barButton("Band karo", 0xFFE5484D, v -> stopAll())));
+        col.addView(c4, cardLp());
+
+        return page;
+    }
+
+    private TextView sectionLabel(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(cHint);
+        t.setTextSize(11);
+        t.setLetterSpacing(0.12f);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(dp(4), dp(18), dp(4), dp(6));
+        return t;
+    }
+
+    private LinearLayout card() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setPadding(dp(14), dp(12), dp(14), dp(12));
+        setCardBg(c, cBox, 16);
+        return c;
+    }
+
+    private LinearLayout.LayoutParams cardLp() {
+        return new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    }
+
+    private View divider() {
+        View d = new View(this);
+        d.setBackgroundColor(cStroke);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+        lp.setMargins(0, dp(10), 0, dp(10));
+        d.setLayoutParams(lp);
+        return d;
+    }
+
+    private LinearLayout settingRow(String title, String sub, Button action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextColor(cText);
+        t.setTextSize(15);
+        t.setTypeface(medium());
+        TextView s = new TextView(this);
+        s.setText(sub);
+        s.setTextColor(cHint);
+        s.setTextSize(12);
+        texts.addView(t);
+        texts.addView(s);
+        row.addView(texts, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(dp(100), dp(42));
+        alp.leftMargin = dp(10);
+        row.addView(action, alp);
+        return row;
+    }
+
+    private Drawable swatch(int i, boolean selected) {
+        GradientDrawable outer = new GradientDrawable();
+        outer.setColor(THEMES[i][0]);
+        outer.setCornerRadius(dp(12));
+        outer.setStroke(selected ? dp(3) : dp(1), selected ? cAccent : cStroke);
+        GradientDrawable inner = new GradientDrawable();
+        inner.setShape(GradientDrawable.OVAL);
+        inner.setColor(THEMES[i][4]);
+        LayerDrawable ld = new LayerDrawable(new Drawable[]{outer, inner});
+        ld.setLayerInset(1, dp(13), dp(13), dp(13), dp(13));
+        return ld;
+    }
+
+    private void stopAll() {
+        try {
+            Intent i = new Intent(this, KeepAliveService.class);
+            i.setAction("STOP");
+            startService(i);
+        } catch (Throwable ignored) {
+        }
+        Toast.makeText(this, "Band kar diya", Toast.LENGTH_SHORT).show();
+        finish();
+    }
+
+    // ---------------- paste / clear ----------------
 
     private void pasteText() {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
@@ -812,6 +1160,7 @@ public class MainActivity extends Activity {
         b.setText(key.label);
         b.setAllCaps(false);
         b.setTextColor(cText);
+        b.setTypeface(medium());
         b.setTextSize(key.label.length() > 2 ? 13 : (key.label.length() == 2 ? 17 : 20));
         b.setMinWidth(0);
         b.setMinimumWidth(0);
@@ -819,7 +1168,7 @@ public class MainActivity extends Activity {
         b.setMinimumHeight(0);
         b.setPadding(0, 0, 0, 0);
         b.setStateListAnimator(null);
-        setBg(b, key.mod != 0 ? cMod : cKey);
+        setKeyBg(b, key.mod != 0 ? cMod : cKey);
 
         if (key.mod != 0) {
             modButtons.add(b);
@@ -833,7 +1182,7 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_DOWN:
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                     if (key.mod == 0) {
-                        setBg(b, cPressed);
+                        setKeyBg(b, cPressed);
                         send(mods, key.code);
                         echo(key.code);
                     }
@@ -845,7 +1194,7 @@ public class MainActivity extends Activity {
                         refreshMods();
                     } else {
                         send(mods, 0);
-                        setBg(b, cKey);
+                        setKeyBg(b, cKey);
                         if (mods != 0) {
                             mods = 0;
                             send(0, 0);
@@ -856,7 +1205,7 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_CANCEL:
                     if (key.mod == 0) {
                         send(mods, 0);
-                        setBg(b, cKey);
+                        setKeyBg(b, cKey);
                     }
                     return true;
                 default:
@@ -891,7 +1240,7 @@ public class MainActivity extends Activity {
     private void refreshMods() {
         for (int i = 0; i < modButtons.size(); i++) {
             boolean on = (mods & modKeys.get(i).mod) != 0;
-            setBg(modButtons.get(i), on ? cAccent : cMod);
+            setKeyBg(modButtons.get(i), on ? cAccent : cMod);
         }
         boolean shift = (mods & M_SHIFT) != 0;
         for (Button b : letterButtons) {
@@ -975,20 +1324,21 @@ public class MainActivity extends Activity {
         b.setText(text);
         b.setAllCaps(false);
         b.setTextColor(cText);
+        b.setTypeface(medium());
         b.setTextSize(15);
         b.setStateListAnimator(null);
-        setBg(b, cMod);
+        setKeyBg(b, cMod);
         b.setOnTouchListener((v, e) -> {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-                    setBg(b, cAccent);
+                    setKeyBg(b, cAccent);
                     mouseButtons |= mask;
                     sendMouse(0, 0, 0);
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
-                    setBg(b, cMod);
+                    setKeyBg(b, cMod);
                     mouseButtons &= ~mask;
                     sendMouse(0, 0, 0);
                     return true;
@@ -1011,8 +1361,8 @@ public class MainActivity extends Activity {
                     accY = 0;
                     return true;
                 case MotionEvent.ACTION_MOVE:
-                    accX += (e.getX() - lastX) * SENS;
-                    accY += (e.getY() - lastY) * SENS;
+                    accX += (e.getX() - lastX) * sens;
+                    accY += (e.getY() - lastY) * sens;
                     lastX = e.getX();
                     lastY = e.getY();
                     if (Math.abs(lastX - downX) > dp(8) || Math.abs(lastY - downY) > dp(8)) {
@@ -1141,10 +1491,13 @@ public class MainActivity extends Activity {
         if (status == null) return;
         if (sHost != null) {
             status.setText("Connected: " + sHost.getName());
+            setDotColor(0xFF34C759);
         } else if (sRegistered) {
-            status.setText("Tayyar hai. 'Laptop chuno' dabao");
+            status.setText("Tayyar hai. Settings se laptop chuno");
+            setDotColor(0xFFFFB020);
         } else {
             status.setText("Bluetooth keyboard shuru ho raha hai...");
+            setDotColor(0xFF8E8E93);
         }
     }
 
@@ -1174,6 +1527,8 @@ public class MainActivity extends Activity {
                     boolean ok = sHid.connect(list.get(i));
                     status.setText(ok ? "Connect ho raha hai..."
                             : "Connect nahi hua, dobara try karo");
+                    Toast.makeText(this, ok ? "Connect ho raha hai..." : "Connect nahi hua",
+                            Toast.LENGTH_SHORT).show();
                 })
                 .show();
     }
