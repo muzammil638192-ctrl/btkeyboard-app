@@ -49,6 +49,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -108,10 +109,14 @@ public class MainActivity extends Activity {
     private int theme = 0;
     private int cBg, cKey, cMod, cPressed, cAccent, cGreen, cText, cPad, cBox, cHint, cStroke;
     private float sens = 1.8f;
+    private int typeDelay = 14;
+    private boolean liveGboard = false;
 
     private void loadTheme() {
         theme = getSharedPreferences("ui", MODE_PRIVATE).getInt("theme", 0) % THEMES.length;
         sens = getSharedPreferences("ui", MODE_PRIVATE).getInt("sens", 18) / 10f;
+        typeDelay = getSharedPreferences("ui", MODE_PRIVATE).getInt("delay", 14);
+        liveGboard = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("live", false);
         int[] t = THEMES[theme];
         cBg = t[0]; cKey = t[1]; cMod = t[2]; cPressed = t[3]; cAccent = t[4];
         cGreen = t[5]; cText = t[6]; cPad = t[7]; cBox = t[8]; cHint = t[9];
@@ -176,6 +181,27 @@ public class MainActivity extends Activity {
             if (reg && sHost == null) reconnectLast();
             refreshUi();
         }
+
+        @Override
+        public void onGetReport(BluetoothDevice device, byte type, byte id, int bufferSize) {
+            try {
+                int rid = id & 0xFF;
+                int len = rid == 1 ? 8 : (rid == 2 ? 4 : (rid == 3 ? 2 : 0));
+                sHid.replyReport(device, type, id, new byte[len]);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void onSetReport(BluetoothDevice device, byte type, byte id, byte[] data) {
+            try {
+                sHid.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void onSetProtocol(BluetoothDevice device, byte protocol) { }
 
         @Override
         public void onConnectionStateChanged(BluetoothDevice device, int state) {
@@ -321,12 +347,22 @@ public class MainActivity extends Activity {
     private View dot;
     private EditText box;
     private Button[] tabBtns;
+    private Button sendBtn;
     private LinearLayout boxRow, kb, gboardPage, mousePage, mainRoot;
     private View settingsRoot;
     private boolean settingsOpen = false;
     private int tab = 0;
     private boolean suppress = false;
     private String prev = "";
+
+    private final Runnable syncRun = () -> {
+        String cur = box.getText().toString();
+        if (!cur.equals(prev)) {
+            String was = prev;
+            prev = cur;
+            syncToLaptop(was, cur);
+        }
+    };
 
     private final ArrayDeque<int[]> queue = new ArrayDeque<>();
     private boolean pumping = false;
@@ -613,7 +649,7 @@ public class MainActivity extends Activity {
         tabsLp.topMargin = dp(4);
         mainRoot.addView(tabs, tabsLp);
 
-        // text box + paste / clear (Keys and Gboard tabs)
+        // text box + paste / send / clear (Keys and Gboard tabs)
         boxRow = new LinearLayout(this);
         boxRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -636,9 +672,15 @@ public class MainActivity extends Activity {
 
             @Override
             public void afterTextChanged(Editable e) {
-                String now = e.toString();
-                if (!suppress) syncToLaptop(prev, now);
-                prev = now;
+                if (suppress) {
+                    prev = e.toString();
+                } else if (tab == 1 && !liveGboard) {
+                    // manual mode: nothing goes to the laptop until Send is pressed
+                } else {
+                    // wait until the keyboard has finished editing, then send the change
+                    H.removeCallbacks(syncRun);
+                    H.postDelayed(syncRun, 70);
+                }
             }
         });
         LinearLayout.LayoutParams boxLp = new LinearLayout.LayoutParams(
@@ -652,6 +694,8 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         sLp.setMargins(0, dp(2), 0, dp(2));
         side.addView(barButton("Paste", cMod, v -> pasteText()), sLp);
+        sendBtn = barButton("Send", cGreen, v -> sendBox());
+        side.addView(sendBtn, sLp);
         side.addView(barButton("Clear", cMod, v -> clearBox()), sLp);
         boxRow.addView(side, new LinearLayout.LayoutParams(
                 dp(72), LinearLayout.LayoutParams.MATCH_PARENT));
@@ -710,12 +754,12 @@ public class MainActivity extends Activity {
                     LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         }
 
-        // ---- page 1: Gboard (touchpad stays available) ----
+        // ---- page 1: Gboard (touchpad + Enter stay available) ----
         gboardPage = new LinearLayout(this);
         gboardPage.setOrientation(LinearLayout.VERTICAL);
         gboardPage.addView(buildPadRow(), new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        gboardPage.addView(buildClickRow(), new LinearLayout.LayoutParams(
+        gboardPage.addView(buildClickRow(true), new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
         content.addView(gboardPage, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
@@ -725,7 +769,7 @@ public class MainActivity extends Activity {
         mousePage.setOrientation(LinearLayout.VERTICAL);
         mousePage.addView(buildPadRow(), new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        mousePage.addView(buildClickRow(), new LinearLayout.LayoutParams(
+        mousePage.addView(buildClickRow(false), new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
 
         LinearLayout grid = new LinearLayout(this);
@@ -803,12 +847,21 @@ public class MainActivity extends Activity {
         return row;
     }
 
-    private LinearLayout buildClickRow() {
+    private LinearLayout buildClickRow(boolean withEnter) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.addView(clickButton("Left Click", 1), barLp());
         row.addView(clickButton("Right Click", 2), barLp());
+        if (withEnter) {
+            row.addView(barButton("Enter \u21B5", cAccent, v -> tapKey(0x28)), barLp());
+        }
         return row;
+    }
+
+    private void tapKey(int code) {
+        queue.add(new int[]{0, code});
+        queue.add(new int[]{0, 0});
+        pump();
     }
 
     private LinearLayout shortRow(LinearLayout parent) {
@@ -882,6 +935,15 @@ public class MainActivity extends Activity {
         gboardPage.setVisibility(t == 1 ? View.VISIBLE : View.GONE);
         mousePage.setVisibility(t == 2 ? View.VISIBLE : View.GONE);
         boxRow.setVisibility(t == 2 ? View.GONE : View.VISIBLE);
+        if (t != 1) {
+            H.removeCallbacks(syncRun);
+            if (liveGboard) {
+                syncRun.run();
+            } else {
+                prev = box.getText().toString();
+            }
+        }
+        updateSendUi();
         box.setShowSoftInputOnFocus(t == 1);
         final InputMethodManager imm =
                 (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -905,6 +967,32 @@ public class MainActivity extends Activity {
                 tabBtns[i].setTextColor(cText);
             }
         }
+    }
+
+    // Send button + hint only matter in Gboard tab with manual (non-live) typing
+    private void updateSendUi() {
+        boolean manual = (tab == 1 && !liveGboard);
+        sendBtn.setVisibility(manual ? View.VISIBLE : View.GONE);
+        box.setHint(manual ? "Yahan likho, phir Send dabao"
+                : "Yahan likha nazar aayega. Paste bhi kar sakte ho");
+    }
+
+    private void sendBox() {
+        String text = box.getText().toString();
+        if (text.isEmpty()) {
+            Toast.makeText(this, "Box khali hai", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (sHost == null) {
+            Toast.makeText(this, "Pehle laptop connect karo", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        queueText(text);
+        H.removeCallbacks(syncRun);
+        suppress = true;
+        box.setText("");
+        suppress = false;
+        prev = "";
     }
 
     // ---------------- settings screen ----------------
@@ -1037,6 +1125,68 @@ public class MainActivity extends Activity {
         c3.addView(sb, sbLp);
         col.addView(c3, cardLp());
 
+        // typing
+        col.addView(sectionLabel("TYPING"));
+        LinearLayout c5 = card();
+        Switch liveSw = new Switch(this);
+        liveSw.setChecked(liveGboard);
+        liveSw.setOnCheckedChangeListener((btn, on) -> {
+            liveGboard = on;
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("live", on).apply();
+            updateSendUi();
+        });
+        c5.addView(settingRow("Gboard live typing",
+                "Band: Send dabane par hi laptop par jayega", liveSw));
+        c5.addView(divider());
+        LinearLayout tHead = new LinearLayout(this);
+        tHead.setOrientation(LinearLayout.HORIZONTAL);
+        TextView tName = new TextView(this);
+        tName.setText("Typing speed (wait)");
+        tName.setTextColor(cText);
+        tName.setTextSize(15);
+        tName.setTypeface(medium());
+        tHead.addView(tName, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        final TextView tVal = new TextView(this);
+        tVal.setTextColor(cHint);
+        tVal.setTextSize(14);
+        tVal.setText(typeDelay + " ms");
+        tHead.addView(tVal);
+        c5.addView(tHead);
+        TextView tHint = new TextView(this);
+        tHint.setText("Agar laptop par harf ulte ya alag lines mein aayein to slider ko "
+                + "dayen (zyada ms) karo");
+        tHint.setTextColor(cHint);
+        tHint.setTextSize(12);
+        c5.addView(tHint);
+        SeekBar tb = new SeekBar(this);
+        tb.setMax(44);
+        tb.setProgress(Math.max(0, Math.min(44, typeDelay - 6)));
+        tb.setProgressTintList(ColorStateList.valueOf(cAccent));
+        tb.setThumbTintList(ColorStateList.valueOf(cAccent));
+        tb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                typeDelay = p + 6;
+                tVal.setText(typeDelay + " ms");
+                if (fromUser) {
+                    getSharedPreferences("ui", MODE_PRIVATE).edit()
+                            .putInt("delay", typeDelay).apply();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar s) { }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar s) { }
+        });
+        LinearLayout.LayoutParams tbLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        tbLp.topMargin = dp(8);
+        c5.addView(tb, tbLp);
+        col.addView(c5, cardLp());
+
         // stop
         col.addView(sectionLabel("BLUETOOTH"));
         LinearLayout c4 = card();
@@ -1082,7 +1232,7 @@ public class MainActivity extends Activity {
         return d;
     }
 
-    private LinearLayout settingRow(String title, String sub, Button action) {
+    private LinearLayout settingRow(String title, String sub, View action) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -1101,7 +1251,10 @@ public class MainActivity extends Activity {
         texts.addView(s);
         row.addView(texts, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(dp(100), dp(42));
+        LinearLayout.LayoutParams alp = (action instanceof Button)
+                ? new LinearLayout.LayoutParams(dp(100), dp(42))
+                : new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT);
         alp.leftMargin = dp(10);
         row.addView(action, alp);
         return row;
@@ -1147,6 +1300,7 @@ public class MainActivity extends Activity {
     }
 
     private void clearBox() {
+        H.removeCallbacks(syncRun);
         suppress = true;
         box.setText("");
         suppress = false;
@@ -1294,26 +1448,30 @@ public class MainActivity extends Activity {
         pump();
     }
 
+    private int retries = 0;
+
+    // sends one report at a time; retries if the Bluetooth stack says "busy"
     private final Runnable pumpRunnable = new Runnable() {
         @Override
         public void run() {
-            int[] a = queue.poll();
+            int[] a = queue.peek();
             if (a == null) {
                 pumping = false;
                 return;
             }
-            if (a[0] == -1) {
-                sendConsumer(a[1]);
-            } else {
-                send(a[0], a[1]);
+            boolean ok = (a[0] == -1) ? sendConsumer(a[1]) : send(a[0], a[1]);
+            if (ok || ++retries > 8) {
+                queue.poll();
+                retries = 0;
             }
-            H.postDelayed(this, 6);
+            H.postDelayed(this, ok ? typeDelay : 10);
         }
     };
 
     private void pump() {
         if (pumping) return;
         pumping = true;
+        queue.addFirst(new int[]{0, 0});   // start clean: release every key first
         H.post(pumpRunnable);
     }
 
@@ -1433,20 +1591,20 @@ public class MainActivity extends Activity {
         sHid.sendReport(sHost, 2, r);
     }
 
-    private void send(int modifiers, int code) {
-        if (sHid == null || sHost == null) return;
+    private boolean send(int modifiers, int code) {
+        if (sHid == null || sHost == null) return true;
         byte[] r = new byte[8];
         r[0] = (byte) modifiers;
         r[2] = (byte) code;
-        sHid.sendReport(sHost, 1, r);
+        return sHid.sendReport(sHost, 1, r);
     }
 
-    private void sendConsumer(int usage) {
-        if (sHid == null || sHost == null) return;
+    private boolean sendConsumer(int usage) {
+        if (sHid == null || sHost == null) return true;
         byte[] r = new byte[2];
         r[0] = (byte) (usage & 0xFF);
         r[1] = (byte) ((usage >> 8) & 0xFF);
-        sHid.sendReport(sHost, 3, r);
+        return sHid.sendReport(sHost, 3, r);
     }
 
     // ---------------- Bluetooth ----------------
@@ -1538,6 +1696,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
         if (sUi == this) sUi = null;
         H.removeCallbacks(pumpRunnable);
+        H.removeCallbacks(syncRun);
         queue.clear();
         pumping = false;
         // Bluetooth is NOT closed here, so the laptop stays connected
