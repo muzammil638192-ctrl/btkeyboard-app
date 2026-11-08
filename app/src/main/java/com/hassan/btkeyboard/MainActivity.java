@@ -370,18 +370,28 @@ public class MainActivity extends Activity {
     private final List<Button> letterButtons = new ArrayList<>();
     private final List<Button> modButtons = new ArrayList<>();
     private final List<K> modKeys = new ArrayList<>();
+    private final List<LinearLayout> letterViews = new ArrayList<>();
+    private final List<LinearLayout> symViews = new ArrayList<>();
+    private boolean symbols = false;
+    private Button symToggle;
 
     static class K {
         final String label;
         final int code;
         final int mod;
         final float w;
+        final int fmod;   // modifier always sent with this key (Shift for "@", "#" ...)
 
-        K(String label, int code, int mod, float w) {
+        K(String label, int code, int mod, float w, int fmod) {
             this.label = label;
             this.code = code;
             this.mod = mod;
             this.w = w;
+            this.fmod = fmod;
+        }
+
+        K(String label, int code, int mod, float w) {
+            this(label, code, mod, w, 0);
         }
     }
 
@@ -389,6 +399,8 @@ public class MainActivity extends Activity {
     private static K kw(String l, int c, float w) { return new K(l, c, 0, w); }
     private static K mw(String l, int mod, float w) { return new K(l, 0, mod, w); }
     private static K sp(float w) { return new K("", -1, 0, w); }
+    private static K ks(String l, int c) { return new K(l, c, 0, 1f, M_SHIFT); }
+    private static K kt(float w) { return new K("?123", -2, 0, w); }
 
     private static K[] letters(String s) {
         K[] r = new K[s.length()];
@@ -649,7 +661,7 @@ public class MainActivity extends Activity {
         tabsLp.topMargin = dp(4);
         mainRoot.addView(tabs, tabsLp);
 
-        // text box + paste / send / clear (Keys and Gboard tabs)
+        // text box + paste / clear (Keys and Gboard tabs)
         boxRow = new LinearLayout(this);
         boxRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -694,8 +706,6 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         sLp.setMargins(0, dp(2), 0, dp(2));
         side.addView(barButton("Paste", cMod, v -> pasteText()), sLp);
-        sendBtn = barButton("Send", cGreen, v -> sendBox());
-        side.addView(sendBtn, sLp);
         side.addView(barButton("Clear", cMod, v -> clearBox()), sLp);
         boxRow.addView(side, new LinearLayout.LayoutParams(
                 dp(72), LinearLayout.LayoutParams.MATCH_PARENT));
@@ -717,50 +727,56 @@ public class MainActivity extends Activity {
         content.addView(kb, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        List<K[]> rows = new ArrayList<>();
-        rows.add(new K[]{k("Esc", 0x29), k("F1", 0x3A), k("F2", 0x3B), k("F3", 0x3C),
+        List<K[]> topRows = new ArrayList<>();
+        topRows.add(new K[]{k("Esc", 0x29), k("F1", 0x3A), k("F2", 0x3B), k("F3", 0x3C),
                 k("F4", 0x3D), k("F5", 0x3E), k("F6", 0x3F), k("Del", 0x4C)});
-        rows.add(new K[]{k("F7", 0x40), k("F8", 0x41), k("F9", 0x42), k("F10", 0x43),
+        topRows.add(new K[]{k("F7", 0x40), k("F8", 0x41), k("F9", 0x42), k("F10", 0x43),
                 k("F11", 0x44), k("F12", 0x45), k("Home", 0x4A), k("End", 0x4D)});
-        rows.add(new K[]{mw("Ctrl", M_CTRL, 1.3f), mw("Alt", M_ALT, 1.3f),
+        topRows.add(new K[]{mw("Ctrl", M_CTRL, 1.3f), mw("Alt", M_ALT, 1.3f),
                 mw("Win", M_WIN, 1.3f), k("Tab", 0x2B), k("Caps", 0x39),
                 k("\u2190", 0x50), k("\u2193", 0x51), k("\u2191", 0x52), k("\u2192", 0x4F)});
-        rows.add(new K[]{k("`", 0x35), k("-", 0x2D), k("=", 0x2E), k("[", 0x2F),
+        topRows.add(new K[]{k("`", 0x35), k("-", 0x2D), k("=", 0x2E), k("[", 0x2F),
                 k("]", 0x30), k(";", 0x33), k("'", 0x34), k("\\", 0x31), k("/", 0x38)});
-        rows.add(digits());
-        rows.add(letters("qwertyuiop"));
-        rows.add(concat(new K[]{sp(0.5f)}, concat(letters("asdfghjkl"), sp(0.5f))));
-        rows.add(concat(new K[]{mw("Shift", M_SHIFT, 1.5f)},
-                concat(letters("zxcvbnm"), kw("\u232B", 0x2A, 1.5f))));
-        rows.add(new K[]{k(",", 0x36), kw("Space", 0x2C, 5f), k(".", 0x37),
-                kw("Enter", 0x28, 1.6f)});
+        topRows.add(digits());
+        for (K[] row : topRows) addKbRow(row);
 
-        for (K[] row : rows) {
-            LinearLayout r = new LinearLayout(this);
-            r.setOrientation(LinearLayout.HORIZONTAL);
-            for (K key : row) {
-                if (key.code < 0 && key.mod == 0) {
-                    r.addView(new View(this), new LinearLayout.LayoutParams(0,
-                            LinearLayout.LayoutParams.MATCH_PARENT, key.w));
-                    continue;
-                }
-                Button b = makeKey(key);
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                        LinearLayout.LayoutParams.MATCH_PARENT, key.w);
-                lp.setMargins(dp(2), dp(2), dp(2), dp(2));
-                r.addView(b, lp);
-            }
-            kb.addView(r, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        // letters (shown normally)
+        K[][] letterRows = {
+                letters("qwertyuiop"),
+                concat(new K[]{sp(0.5f)}, concat(letters("asdfghjkl"), sp(0.5f))),
+                concat(new K[]{mw("Shift", M_SHIFT, 1.5f)},
+                        concat(letters("zxcvbnm"), kw("\u232B", 0x2A, 1.5f)))
+        };
+        for (K[] row : letterRows) letterViews.add(addKbRow(row));
+
+        // symbols + extra keys (shown after tapping ?123)
+        K[][] symRows = {
+                {ks("!", 0x1E), ks("@", 0x1F), ks("#", 0x20), ks("$", 0x21), ks("%", 0x22),
+                        ks("^", 0x23), ks("&", 0x24), ks("*", 0x25), ks("(", 0x26),
+                        ks(")", 0x27)},
+                {ks("_", 0x2D), ks("+", 0x2E), ks("{", 0x2F), ks("}", 0x30), ks("|", 0x31),
+                        ks(":", 0x33), ks("\"", 0x34), ks("<", 0x36), ks(">", 0x37),
+                        ks("?", 0x38)},
+                {ks("~", 0x35), k("PgUp", 0x4B), k("PgDn", 0x4E), k("Ins", 0x49),
+                        k("PrtSc", 0x46), k("ScrLk", 0x47), k("Pause", 0x48),
+                        k("Menu", 0x65), kw("\u232B", 0x2A, 1.3f)}
+        };
+        for (K[] row : symRows) {
+            LinearLayout v = addKbRow(row);
+            v.setVisibility(View.GONE);
+            symViews.add(v);
         }
 
-        // ---- page 1: Gboard (touchpad + Enter stay available) ----
+        addKbRow(new K[]{kt(1.3f), k(",", 0x36), kw("Space", 0x2C, 4f), k(".", 0x37),
+                kw("Enter", 0x28, 1.5f)});
+
+        // ---- page 1: Gboard (touchpad + Send + Enter) ----
         gboardPage = new LinearLayout(this);
         gboardPage.setOrientation(LinearLayout.VERTICAL);
         gboardPage.addView(buildPadRow(), new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         gboardPage.addView(buildClickRow(true), new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(58)));
         content.addView(gboardPage, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -818,6 +834,55 @@ public class MainActivity extends Activity {
         setTab(0);
     }
 
+    private LinearLayout addKbRow(K[] row) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        for (K key : row) {
+            if (key.code == -1) {
+                r.addView(new View(this), new LinearLayout.LayoutParams(0,
+                        LinearLayout.LayoutParams.MATCH_PARENT, key.w));
+                continue;
+            }
+            Button b = makeKey(key);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.MATCH_PARENT, key.w);
+            lp.setMargins(dp(2), dp(2), dp(2), dp(2));
+            r.addView(b, lp);
+        }
+        kb.addView(r, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        return r;
+    }
+
+    private void toggleSymbols() {
+        symbols = !symbols;
+        for (LinearLayout r : letterViews) r.setVisibility(symbols ? View.GONE : View.VISIBLE);
+        for (LinearLayout r : symViews) r.setVisibility(symbols ? View.VISIBLE : View.GONE);
+        symToggle.setText(symbols ? "ABC" : "?123");
+    }
+
+    private Button makeToggleKey() {
+        final Button b = new Button(this);
+        b.setText("?123");
+        b.setAllCaps(false);
+        b.setTextColor(cText);
+        b.setTypeface(medium());
+        b.setTextSize(13);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setPadding(0, 0, 0, 0);
+        b.setStateListAnimator(null);
+        setKeyBg(b, cMod);
+        b.setOnClickListener(v -> {
+            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            toggleSymbols();
+        });
+        symToggle = b;
+        return b;
+    }
+
     private LinearLayout buildPadRow() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -853,7 +918,12 @@ public class MainActivity extends Activity {
         row.addView(clickButton("Left Click", 1), barLp());
         row.addView(clickButton("Right Click", 2), barLp());
         if (withEnter) {
-            row.addView(barButton("Enter \u21B5", cAccent, v -> tapKey(0x28)), barLp());
+            sendBtn = barButton("Send", cGreen, v -> sendBox());
+            sendBtn.setTextSize(17);
+            row.addView(sendBtn, barLp(1.6f));
+            Button enter = barButton("Enter \u21B5", cAccent, v -> tapKey(0x28));
+            enter.setTextSize(17);
+            row.addView(enter, barLp(1.6f));
         }
         return row;
     }
@@ -873,8 +943,12 @@ public class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams barLp() {
+        return barLp(1f);
+    }
+
+    private LinearLayout.LayoutParams barLp(float w) {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+                LinearLayout.LayoutParams.MATCH_PARENT, w);
         lp.setMargins(dp(2), 0, dp(2), 0);
         return lp;
     }
@@ -1310,12 +1384,13 @@ public class MainActivity extends Activity {
     // ---------------- keyboard keys ----------------
 
     private Button makeKey(final K key) {
+        if (key.code == -2) return makeToggleKey();
         final Button b = new Button(this);
         b.setText(key.label);
         b.setAllCaps(false);
         b.setTextColor(cText);
         b.setTypeface(medium());
-        b.setTextSize(key.label.length() > 2 ? 13 : (key.label.length() == 2 ? 17 : 20));
+        b.setTextSize(key.label.length() > 4 ? 11 : (key.label.length() > 2 ? 13 : (key.label.length() == 2 ? 17 : 20)));
         b.setMinWidth(0);
         b.setMinimumWidth(0);
         b.setMinHeight(0);
@@ -1337,8 +1412,8 @@ public class MainActivity extends Activity {
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                     if (key.mod == 0) {
                         setKeyBg(b, cPressed);
-                        send(mods, key.code);
-                        echo(key.code);
+                        send(mods | key.fmod, key.code);
+                        echo(key.code, key.fmod);
                     }
                     return true;
                 case MotionEvent.ACTION_UP:
@@ -1370,9 +1445,9 @@ public class MainActivity extends Activity {
     }
 
     // show what is typed with the on-screen keys inside the text box (display only)
-    private void echo(int code) {
+    private void echo(int code, int fmod) {
         if ((mods & (M_CTRL | M_ALT | M_WIN)) != 0) return;
-        boolean shift = (mods & M_SHIFT) != 0;
+        boolean shift = ((mods | fmod) & M_SHIFT) != 0;
         suppress = true;
         try {
             Editable t = box.getText();
