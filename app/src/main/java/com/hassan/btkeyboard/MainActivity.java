@@ -22,6 +22,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -62,7 +63,26 @@ import java.util.concurrent.Executor;
 
 @SuppressLint("MissingPermission")
 public class MainActivity extends Activity {
-
+    // Makes the whole UI scale with the phone's screen width (small phones, big phones, tablets).
+    // Normal phones (360-420 dp wide) stay exactly the same.
+    @Override
+    protected void attachBaseContext(Context base) {
+        Configuration c = new Configuration(base.getResources().getConfiguration());
+        float sw = c.smallestScreenWidthDp;
+        if (sw <= 0) sw = Math.min(c.screenWidthDp, c.screenHeightDp);
+        float f = 1f;
+        if (sw > 0 && sw < 360f) {
+            f = Math.max(0.8f, sw / 360f);
+        } else if (sw > 420f) {
+            f = Math.min(1.6f, sw / 420f);
+        }
+        if (f != 1f && c.densityDpi > 0) {
+            c.densityDpi = Math.round(c.densityDpi * f);
+            super.attachBaseContext(base.createConfigurationContext(c));
+        } else {
+            super.attachBaseContext(base);
+        }
+    }
     private static byte[] bytes(int... v) {
         byte[] o = new byte[v.length];
         for (int i = 0; i < v.length; i++) o[i] = (byte) v[i];
